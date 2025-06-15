@@ -30,13 +30,31 @@ def format_timestamp(seconds: float, always_include_hours: bool = False):
     return f"{hours_marker}{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
 
-def write_srt(transcript: Iterator[dict], file: TextIO):
+def write_srt(transcript: Iterator, file: TextIO):
+    """Write an iterator of Whisper segments to an opened SRT file handle.
+
+    The *transcript* iterator may yield either dictionaries with the keys
+    ``{"start", "end", "text"}`` or objects (e.g., ``faster_whisper.Segment``)
+    exposing ``start``, ``end`` and ``text`` attributes. Handling both makes the
+    rest of the codebase agnostic to the concrete Whisper implementation used.
+    """
+
     for i, segment in enumerate(transcript, start=1):
+        # Support both mapping and attribute-based segment representations
+        if isinstance(segment, dict):
+            start = segment["start"]
+            end = segment["end"]
+            text = segment["text"]
+        else:
+            start = segment.start
+            end = segment.end
+            text = segment.text
+
         print(
             f"{i}\n"
-            f"{format_timestamp(segment['start'], always_include_hours=True)} --> "
-            f"{format_timestamp(segment['end'], always_include_hours=True)}\n"
-            f"{segment['text'].strip().replace('-->', '->')}\n",
+            f"{format_timestamp(start, always_include_hours=True)} --> "
+            f"{format_timestamp(end, always_include_hours=True)}\n"
+            f"{text.strip().replace('-->', '->')}\n",
             file=file,
             flush=True,
         )

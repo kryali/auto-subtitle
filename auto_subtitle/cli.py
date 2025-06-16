@@ -1,4 +1,5 @@
 import os
+import sys
 import ffmpeg
 import faster_whisper
 from faster_whisper import WhisperModel
@@ -39,7 +40,19 @@ def main():
     task: str = args.pop("task")
     language: str = args.pop("language")
     device: str = args.pop("device")
+    verbose: bool = args.pop("verbose")
     
+    # Pre-flight: make sure every supplied video file is accessible before doing any heavy work.
+    video_paths = args.pop("video")
+    missing = [p for p in video_paths if not os.path.isfile(p)]
+    if missing:
+        print("The following input file(s) were not found:")
+        for p in missing:
+            print(f"  {p}")
+        print("Aborting.")
+        sys.exit(1)
+    
+    # All files exist; continue processing.
     os.makedirs(output_dir, exist_ok=True)
 
     if model_name.endswith(".en"):
@@ -54,7 +67,7 @@ def main():
     final_language = args.get("language", "auto")
 
     model = WhisperModel(model_name, device=device)
-    audios = get_audio(args.pop("video"))
+    audios = get_audio(video_paths, verbose=verbose)
 
     # Build a small wrapper so we cleanly forward the user-requested parameters to
     # WhisperModel.transcribe while keeping get_subtitles unaware of them.
@@ -87,12 +100,12 @@ def main():
 
         ffmpeg.concat(
             video.filter('subtitles', srt_path, force_style="OutlineColour=&H40000000,BorderStyle=3"), audio, v=1, a=1
-        ).output(out_path).run(quiet=True, overwrite_output=True)
+        ).output(out_path).run(quiet=not verbose, overwrite_output=True)
 
         print(f"Saved subtitled video to {os.path.abspath(out_path)}.")
 
 
-def get_audio(paths):
+def get_audio(paths, *, verbose: bool = False):
     temp_dir = tempfile.gettempdir()
 
     audio_paths = {}
@@ -101,10 +114,22 @@ def get_audio(paths):
         print(f"Extracting audio from {filename(path)}...")
         output_path = os.path.join(temp_dir, f"{filename(path)}.wav")
 
-        ffmpeg.input(path).output(
-            output_path,
-            acodec="pcm_s16le", ac=1, ar="16k"
-        ).run(quiet=True, overwrite_output=True)
+        try:
+            ffmpeg.input(path).output(
+                output_path,
+                acodec="pcm_s16le", ac=1, ar="16k"
+            ).run(quiet=not verbose, overwrite_output=True)
+        except ffmpeg.Error as e:
+            # Surface the underlying ffmpeg stderr so users know what went wrong.
+            print(f"Failed to extract audio from {path} (ffmpeg execution failed).")
+            if e.stderr:
+                try:
+                    print(e.stderr.decode("utf-8", errors="ignore"))
+                except AttributeError:
+                    # stderr might already be str depending on ffmpeg-python version.
+                    print(e.stderr)
+            # Re-raise so the CLI exits with a non-zero status code.
+            raise
 
         audio_paths[path] = output_path
 

@@ -1,5 +1,7 @@
 import os
 import sys
+import time
+import logging
 import ffmpeg
 import faster_whisper
 from faster_whisper import WhisperModel
@@ -8,6 +10,33 @@ import warnings
 import tempfile
 import subprocess
 from .utils import filename, str2bool, write_srt
+
+# Module-level logger
+logger = logging.getLogger(__name__)
+
+
+def format_duration(seconds):
+    """Format duration in seconds to a human-readable string"""
+    if seconds < 60:
+        return f"{seconds:.1f} seconds"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.1f}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours}h {minutes}m {secs:.1f}s"
+
+
+def setup_logging():
+    """Setup logging configuration"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
 
 
 def check_gpu_encoders():
@@ -33,6 +62,8 @@ def check_gpu_encoders():
 
 
 def main():
+    setup_logging()
+    
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("video", nargs="+", type=str,
@@ -72,14 +103,22 @@ def main():
     video_paths = args.pop("video")
     missing = [p for p in video_paths if not os.path.isfile(p)]
     if missing:
-        print("The following input file(s) were not found:")
+        logger.error("The following input file(s) were not found:")
         for p in missing:
-            print(f"  {p}")
-        print("Aborting.")
+            logger.error(f"  {p}")
+        logger.error("Aborting.")
         sys.exit(1)
     
     # All files exist; continue processing.
     os.makedirs(output_dir, exist_ok=True)
+
+    # Log start time
+    logger.info("🚀 Starting auto-subtitle processing")
+    logger.info(f"📁 Processing {len(video_paths)} file(s) with model '{model_name}' (task: {task})")
+    if language != "auto":
+        logger.info(f"🌐 Source language: {language}")
+    
+    overall_start_time = time.time()
 
     if model_name.endswith(".en"):
         warnings.warn(
@@ -92,8 +131,18 @@ def main():
     # Keep track of the final language value that will be supplied to Whisper
     final_language = args.get("language", "auto")
 
+    logger.info(f"Loading Whisper model '{model_name}'...")
+    model_start = time.time()
     model = WhisperModel(model_name, device=device)
+    model_end = time.time()
+    logger.info(f"✓ Model loaded in {format_duration(model_end - model_start)}")
+
+    # Audio extraction phase
+    logger.info(f"📥 Starting audio extraction for {len(video_paths)} file(s)...")
+    audio_start = time.time()
     audios = get_audio(video_paths, verbose=verbose)
+    audio_end = time.time()
+    logger.info(f"✓ Audio extraction phase completed in {format_duration(audio_end - audio_start)}")
 
     # Build a small wrapper so we cleanly forward the user-requested parameters to
     # WhisperModel.transcribe while keeping get_subtitles unaware of them.
@@ -106,27 +155,46 @@ def main():
             kwargs["language"] = final_language
         return model.transcribe(audio_path, **kwargs)
 
+    # Subtitle generation phase
+    logger.info(f"🎯 Starting subtitle generation for {len(audios)} file(s)...")
+    subtitle_start = time.time()
     subtitles = get_subtitles(
         audios,
         output_srt or srt_only,
         output_dir,
         transcribe_fn,
     )
+    subtitle_end = time.time()
+    logger.info(f"✓ Subtitle generation phase completed in {format_duration(subtitle_end - subtitle_start)}")
 
     if srt_only:
+        # Calculate and display timing summary for SRT-only mode
+        overall_end_time = time.time()
+        total_time = overall_end_time - overall_start_time
+        
+        logger.info("🎉 SRT generation completed successfully!")
+        logger.info(f"📊 Total time: {format_duration(total_time)}")
+        logger.info(f"   • Model loading: {format_duration(model_end - model_start)}")
+        logger.info(f"   • Audio extraction: {format_duration(audio_end - audio_start)}")
+        logger.info(f"   • Subtitle generation: {format_duration(subtitle_end - subtitle_start)}")
         return
 
     # Check available GPU encoders once
     available_gpu_encoders = check_gpu_encoders() if gpu_accel else []
     if gpu_accel and available_gpu_encoders and verbose:
-        print(f"GPU encoders available: {', '.join(available_gpu_encoders)}")
+        logger.info(f"GPU encoders available: {', '.join(available_gpu_encoders)}")
     elif gpu_accel and not available_gpu_encoders:
-        print("GPU acceleration requested but no compatible encoders found, using CPU encoding")
+        logger.warning("GPU acceleration requested but no compatible encoders found, using CPU encoding")
+
+    # Video encoding phase
+    logger.info(f"🎬 Starting video encoding for {len(subtitles)} file(s)...")
+    encoding_start = time.time()
 
     for path, srt_path in subtitles.items():
         out_path = os.path.join(output_dir, f"{filename(path)}.mp4")
 
-        print(f"Adding subtitles to {filename(path)}...")
+        logger.info(f"Adding subtitles to {filename(path)}...")
+        start_time = time.time()
 
         video = ffmpeg.input(path)
         audio = video.audio
@@ -141,7 +209,7 @@ def main():
                     'cq': '23'           # Constant quality
                 })
                 if verbose:
-                    print("Using NVIDIA GPU acceleration for video encoding...")
+                    logger.info("Using NVIDIA GPU acceleration for video encoding...")
             elif 'qsv' in available_gpu_encoders:
                 output_kwargs.update({
                     'c:v': 'h264_qsv',
@@ -149,7 +217,7 @@ def main():
                     'global_quality': '23'
                 })
                 if verbose:
-                    print("Using Intel QSV GPU acceleration for video encoding...")
+                    logger.info("Using Intel QSV GPU acceleration for video encoding...")
         else:
             # Use CPU encoding
             output_kwargs.update({
@@ -158,13 +226,30 @@ def main():
                 'crf': '23'
             })
             if verbose and gpu_accel:
-                print("Using CPU encoding (no GPU encoders available)...")
+                logger.info("Using CPU encoding (no GPU encoders available)...")
 
         ffmpeg.concat(
             video.filter('subtitles', srt_path, force_style="OutlineColour=&H40000000,BorderStyle=3"), audio, v=1, a=1
         ).output(out_path, **output_kwargs).run(quiet=not verbose, overwrite_output=True)
 
-        print(f"Saved subtitled video to {os.path.abspath(out_path)}.")
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info(f"✓ Subtitle overlay completed in {format_duration(duration)}")
+        logger.info(f"Saved subtitled video to {os.path.abspath(out_path)}.")
+
+    encoding_end = time.time()
+    logger.info(f"✓ Video encoding phase completed in {format_duration(encoding_end - encoding_start)}")
+    
+    # Calculate and display overall timing
+    overall_end_time = time.time()
+    total_time = overall_end_time - overall_start_time
+    
+    logger.info("🎉 All processing completed successfully!")
+    logger.info(f"📊 Total time: {format_duration(total_time)}")
+    logger.info(f"   • Model loading: {format_duration(model_end - model_start)}")
+    logger.info(f"   • Audio extraction: {format_duration(audio_end - audio_start)}")
+    logger.info(f"   • Subtitle generation: {format_duration(subtitle_end - subtitle_start)}")
+    logger.info(f"   • Video encoding: {format_duration(encoding_end - encoding_start)}")
 
 
 def get_audio(paths, *, verbose: bool = False):
@@ -173,7 +258,8 @@ def get_audio(paths, *, verbose: bool = False):
     audio_paths = {}
 
     for path in paths:
-        print(f"Extracting audio from {filename(path)}...")
+        logger.info(f"Extracting audio from {filename(path)}...")
+        start_time = time.time()
         output_path = os.path.join(temp_dir, f"{filename(path)}.wav")
 
         try:
@@ -183,15 +269,19 @@ def get_audio(paths, *, verbose: bool = False):
             ).run(quiet=not verbose, overwrite_output=True)
         except ffmpeg.Error as e:
             # Surface the underlying ffmpeg stderr so users know what went wrong.
-            print(f"Failed to extract audio from {path} (ffmpeg execution failed).")
+            logger.error(f"Failed to extract audio from {path} (ffmpeg execution failed).")
             if e.stderr:
                 try:
-                    print(e.stderr.decode("utf-8", errors="ignore"))
+                    logger.error(e.stderr.decode("utf-8", errors="ignore"))
                 except AttributeError:
                     # stderr might already be str depending on ffmpeg-python version.
-                    print(e.stderr)
+                    logger.error(e.stderr)
             # Re-raise so the CLI exits with a non-zero status code.
             raise
+
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info(f"✓ Audio extraction completed in {format_duration(duration)}")
 
         audio_paths[path] = output_path
 
@@ -205,9 +295,10 @@ def get_subtitles(audio_paths: list, output_srt: bool, output_dir: str, transcri
         srt_path = output_dir if output_srt else tempfile.gettempdir()
         srt_path = os.path.join(srt_path, f"{filename(path)}.srt")
         
-        print(
+        logger.info(
             f"Generating subtitles for {filename(path)}... This might take a while."
         )
+        start_time = time.time()
 
         warnings.filterwarnings("ignore")
         segments, _ = transcribe(audio_path)
@@ -215,6 +306,10 @@ def get_subtitles(audio_paths: list, output_srt: bool, output_dir: str, transcri
 
         with open(srt_path, "w", encoding="utf-8") as srt:
             write_srt(segments, file=srt)
+
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info(f"✓ Subtitle generation completed in {format_duration(duration)}")
 
         subtitles_path[path] = srt_path
 

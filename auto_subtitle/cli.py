@@ -6,7 +6,30 @@ from faster_whisper import WhisperModel
 import argparse
 import warnings
 import tempfile
+import subprocess
 from .utils import filename, str2bool, write_srt
+
+
+def check_gpu_encoders():
+    """Check which GPU encoders are available on the system"""
+    available_encoders = []
+    
+    try:
+        # Check ffmpeg encoders
+        result = subprocess.run(['ffmpeg', '-encoders'], 
+                              capture_output=True, text=True, timeout=10)
+        encoders_output = result.stdout
+        
+        if 'h264_nvenc' in encoders_output:
+            available_encoders.append('nvenc')
+        if 'h264_qsv' in encoders_output:
+            available_encoders.append('qsv')
+            
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
+        # ffmpeg not available or other error
+        pass
+    
+    return available_encoders
 
 
 def main():
@@ -20,6 +43,8 @@ def main():
                         choices=["auto", "cpu", "cuda"], help="device to use for inference (auto, cpu, or cuda)")
     parser.add_argument("--output_dir", "-o", type=str,
                         default=".", help="directory to save the outputs")
+    parser.add_argument("--gpu_accel", type=str2bool, default=True,
+                        help="whether to use GPU acceleration for video encoding (if available)")
     parser.add_argument("--output_srt", type=str2bool, default=False,
                         help="whether to output the .srt file along with the video files")
     parser.add_argument("--srt_only", type=str2bool, default=False,
@@ -40,6 +65,7 @@ def main():
     task: str = args.pop("task")
     language: str = args.pop("language")
     device: str = args.pop("device")
+    gpu_accel: bool = args.pop("gpu_accel")
     verbose: bool = args.pop("verbose")
     
     # Pre-flight: make sure every supplied video file is accessible before doing any heavy work.
@@ -90,6 +116,13 @@ def main():
     if srt_only:
         return
 
+    # Check available GPU encoders once
+    available_gpu_encoders = check_gpu_encoders() if gpu_accel else []
+    if gpu_accel and available_gpu_encoders and verbose:
+        print(f"GPU encoders available: {', '.join(available_gpu_encoders)}")
+    elif gpu_accel and not available_gpu_encoders:
+        print("GPU acceleration requested but no compatible encoders found, using CPU encoding")
+
     for path, srt_path in subtitles.items():
         out_path = os.path.join(output_dir, f"{filename(path)}.mp4")
 
@@ -98,9 +131,38 @@ def main():
         video = ffmpeg.input(path)
         audio = video.audio
 
+        # Configure GPU acceleration if available
+        output_kwargs = {}
+        if gpu_accel and available_gpu_encoders:
+            if 'nvenc' in available_gpu_encoders:
+                output_kwargs.update({
+                    'c:v': 'h264_nvenc',  # Use NVIDIA hardware encoder
+                    'preset': 'p4',       # Fast preset for NVENC
+                    'cq': '23'           # Constant quality
+                })
+                if verbose:
+                    print("Using NVIDIA GPU acceleration for video encoding...")
+            elif 'qsv' in available_gpu_encoders:
+                output_kwargs.update({
+                    'c:v': 'h264_qsv',
+                    'preset': 'fast',
+                    'global_quality': '23'
+                })
+                if verbose:
+                    print("Using Intel QSV GPU acceleration for video encoding...")
+        else:
+            # Use CPU encoding
+            output_kwargs.update({
+                'c:v': 'libx264',
+                'preset': 'fast',
+                'crf': '23'
+            })
+            if verbose and gpu_accel:
+                print("Using CPU encoding (no GPU encoders available)...")
+
         ffmpeg.concat(
             video.filter('subtitles', srt_path, force_style="OutlineColour=&H40000000,BorderStyle=3"), audio, v=1, a=1
-        ).output(out_path).run(quiet=not verbose, overwrite_output=True)
+        ).output(out_path, **output_kwargs).run(quiet=not verbose, overwrite_output=True)
 
         print(f"Saved subtitled video to {os.path.abspath(out_path)}.")
 

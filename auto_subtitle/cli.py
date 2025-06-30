@@ -9,6 +9,7 @@ import argparse
 import warnings
 import tempfile
 import subprocess
+from tqdm import tqdm
 from .utils import filename, str2bool, write_srt
 
 # Module-level logger
@@ -301,11 +302,54 @@ def get_subtitles(audio_paths: list, output_srt: bool, output_dir: str, transcri
         start_time = time.time()
 
         warnings.filterwarnings("ignore")
-        segments, _ = transcribe(audio_path)
+        segments, info = transcribe(audio_path)
         warnings.filterwarnings("default")
 
+        # Get audio duration for progress estimation
+        audio_duration = getattr(info, 'duration', None)
+        
+        # Convert segments iterator to list with progress bar
+        logger.info("Processing segments...")
+        segments_list = []
+        
+        # Create progress bar
+        if audio_duration:
+            # If we know the duration, show progress based on timestamp
+            progress_bar = tqdm(
+                desc="Processing", 
+                unit=" segments",
+                total=None,  # We don't know total segments upfront
+                bar_format="{desc}: {n} segments | {elapsed} | {postfix}"
+            )
+        else:
+            # Simple segment counter if no duration available
+            progress_bar = tqdm(
+                desc="Processing", 
+                unit=" segments",
+                bar_format="{desc}: {n} segments | {elapsed}"
+            )
+
+        try:
+            last_end_time = 0
+            for segment in segments:
+                segments_list.append(segment)
+                progress_bar.update(1)
+                
+                # Update progress description with time info if available
+                if audio_duration and hasattr(segment, 'end'):
+                    last_end_time = segment.end
+                    progress_percentage = (last_end_time / audio_duration) * 100
+                    progress_bar.set_postfix_str(
+                        f"{last_end_time:.1f}s/{audio_duration:.1f}s ({progress_percentage:.1f}%)"
+                    )
+                    
+        finally:
+            progress_bar.close()
+
+        logger.info(f"Processed {len(segments_list)} segments")
+
         with open(srt_path, "w", encoding="utf-8") as srt:
-            write_srt(segments, file=srt)
+            write_srt(segments_list, file=srt)
 
         end_time = time.time()
         duration = end_time - start_time

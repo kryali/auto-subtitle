@@ -1,4 +1,5 @@
 import os
+import warnings
 from typing import Iterator, TextIO
 
 
@@ -14,6 +15,9 @@ def str2bool(string):
 
 
 def format_timestamp(seconds: float, always_include_hours: bool = False):
+    # Disallow missing timestamps to avoid silent errors
+    if seconds is None:
+        raise ValueError("Timestamp value cannot be None")
     assert seconds >= 0, "non-negative timestamp expected"
     milliseconds = round(seconds * 1000.0)
 
@@ -49,6 +53,21 @@ def write_srt(transcript: Iterator, file: TextIO):
             start = segment.start
             end = segment.end
             text = segment.text
+
+        # Skip segments with missing or illogical timestamps to avoid corrupt SRT entries
+        if start is None or end is None:
+            warnings.warn(
+                "Skipping segment due to missing timestamp(s): "
+                f"start={start}, end={end}"
+            )
+            continue
+
+        if end < start:
+            warnings.warn(
+                "Skipping segment because end time precedes start time: "
+                f"start={start}, end={end}"
+            )
+            continue
 
         print(
             f"{i}\n"

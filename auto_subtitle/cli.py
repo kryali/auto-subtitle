@@ -84,7 +84,7 @@ def main():
     parser.add_argument("--srt_only", type=str2bool, default=False,
                         help="only generate the .srt file and not create overlayed video")
     parser.add_argument("--verbose", type=str2bool, default=False,
-                        help="whether to print out the progress and debug messages")
+                        help="print ffmpeg command output (otherwise ffmpeg runs in quiet mode)")
 
     parser.add_argument("--task", type=str, default="transcribe", choices=[
                         "transcribe", "translate"], help="whether to perform X->X speech recognition ('transcribe') or X->English translation ('translate')")
@@ -203,18 +203,56 @@ def main():
         # Clear any conflicting forced_decoder_ids when using task parameter
         generate_kwargs["forced_decoder_ids"] = None
         
+        # Ensure proper timestamp handling by setting return_timestamps in generate_kwargs as well
+        generate_kwargs["return_timestamps"] = True
+        
         if generate_kwargs:
             call_kwargs["generate_kwargs"] = generate_kwargs
+            
+        logger.info(f"Pipeline call kwargs: {call_kwargs}")
 
         outputs = pipe(audio_path, **call_kwargs)
 
         # Convert pipeline chunks to faster-whisper compatible segments
         segments = []
+        skipped_segments = 0
+        
         for ch in outputs.get("chunks", []):
             start, end = ch["timestamp"]
-            segments.append(type("Segment", (), {"start": start, "end": end, "text": ch["text"]}))
+            text = ch["text"]
+            
+            # Skip segments with None timestamps entirely - don't create fake ones
+            if start is None or end is None:
+                skipped_segments += 1
+                logger.warning(f"Skipping segment with missing timestamp: '{text.strip()}'")
+                continue
+                
+            segments.append(type("Segment", (), {"start": start, "end": end, "text": text}))
 
-        duration = segments[-1].end if segments else 0.0
+        # Log if we had to skip segments
+        if skipped_segments > 0:
+            logger.warning(f"Skipped {skipped_segments} segments due to missing timestamps")
+
+        # Calculate duration from segments, with fallback
+        if segments and segments[-1].end is not None:
+            duration = segments[-1].end
+        else:
+            # Fallback: estimate duration from audio file if possible
+            try:
+                # Try to get duration using ffmpeg-python (already available)
+                probe = ffmpeg.probe(audio_path)
+                duration = float(probe['streams'][0]['duration'])
+            except:
+                try:
+                    # Fallback to librosa if available
+                    import librosa
+                    y, sr = librosa.load(audio_path, sr=None)
+                    duration = len(y) / sr
+                except:
+                    # Final fallback: estimate based on number of segments
+                    duration = len(segments) * 2.0 if segments else 0.0
+                    logger.warning(f"Could not determine audio duration for {audio_path}, using estimated duration: {duration}s")
+        
         info = SimpleNamespace(duration=duration)
         return segments, info
 
@@ -244,7 +282,7 @@ def main():
 
     # Check available GPU encoders once
     available_gpu_encoders = check_gpu_encoders() if gpu_accel else []
-    if gpu_accel and available_gpu_encoders and verbose:
+    if gpu_accel and available_gpu_encoders:
         logger.info(f"GPU encoders available: {', '.join(available_gpu_encoders)}")
     elif gpu_accel and not available_gpu_encoders:
         logger.warning("GPU acceleration requested but no compatible encoders found, using CPU encoding")
@@ -271,16 +309,14 @@ def main():
                     'preset': 'p4',       # Fast preset for NVENC
                     'cq': '23'           # Constant quality
                 })
-                if verbose:
-                    logger.info("Using NVIDIA GPU acceleration for video encoding...")
+                logger.info("Using NVIDIA GPU acceleration for video encoding...")
             elif 'qsv' in available_gpu_encoders:
                 output_kwargs.update({
                     'c:v': 'h264_qsv',
                     'preset': 'fast',
                     'global_quality': '23'
                 })
-                if verbose:
-                    logger.info("Using Intel QSV GPU acceleration for video encoding...")
+                logger.info("Using Intel QSV GPU acceleration for video encoding...")
         else:
             # Use CPU encoding
             output_kwargs.update({
@@ -288,7 +324,7 @@ def main():
                 'preset': 'fast',
                 'crf': '23'
             })
-            if verbose and gpu_accel:
+            if gpu_accel:
                 logger.info("Using CPU encoding (no GPU encoders available)...")
 
         ffmpeg.concat(

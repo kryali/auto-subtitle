@@ -3,8 +3,10 @@ import sys
 import time
 import logging
 import ffmpeg
-import faster_whisper
-from faster_whisper import WhisperModel
+import torch
+from types import SimpleNamespace
+from transformers import pipeline
+from transformers.utils import is_flash_attn_2_available
 import argparse
 import warnings
 import tempfile
@@ -69,8 +71,8 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("video", nargs="+", type=str,
                         help="paths to video files to transcribe")
-    parser.add_argument("--model", default="small",
-                        choices=faster_whisper.available_models(), help="name of the Whisper model to use")
+    parser.add_argument("--model", default="openai/whisper-small",
+                        help="HuggingFace repo or path of the Whisper model to use (e.g. openai/whisper-large-v3)")
     parser.add_argument("--device", type=str, default="auto",
                         choices=["auto", "cpu", "cuda"], help="device to use for inference (auto, cpu, or cuda)")
     parser.add_argument("--output_dir", "-o", type=str,
@@ -132,9 +134,43 @@ def main():
     # Keep track of the final language value that will be supplied to Whisper
     final_language = args.get("language", "auto")
 
-    logger.info(f"Loading Whisper model '{model_name}'...")
+    logger.info(f"Loading Whisper model '{model_name}' using transformers pipeline…")
     model_start = time.time()
-    model = WhisperModel(model_name, device=device)
+
+    # Choose device for pipeline
+    if device == "cuda":
+        device_id = 0
+    elif device == "cpu":
+        device_id = -1
+    else:  # auto
+        device_id = 0 if torch.cuda.is_available() else -1
+
+    model_kwargs = {}
+    
+    # Only use Flash Attention 2 if available and on GPU
+    if device_id != -1 and is_flash_attn_2_available():
+        logger.info("🚀 Using Flash Attention 2 for maximum speed")
+        model_kwargs["attn_implementation"] = "flash_attention_2"
+        # Force model to initialize directly on GPU for Flash Attention 2
+        model_kwargs["device_map"] = "auto"
+    elif device_id != -1:
+        logger.info("⚠️  Flash Attention 2 not available, using standard attention (slower)")
+    else:
+        logger.info("💻 Using CPU inference with standard attention")
+
+    # Create pipeline - don't use device parameter when device_map is specified
+    pipeline_kwargs = {
+        "model": model_name,
+        "torch_dtype": torch.float16 if device_id != -1 else torch.float32,
+        "model_kwargs": model_kwargs,
+    }
+    
+    # Add device parameter only if we're not using device_map
+    if "device_map" not in model_kwargs:
+        pipeline_kwargs["device"] = device_id
+    
+    pipe = pipeline("automatic-speech-recognition", **pipeline_kwargs)
+
     model_end = time.time()
     logger.info(f"✓ Model loaded in {format_duration(model_end - model_start)}")
 
@@ -148,13 +184,39 @@ def main():
     # Build a small wrapper so we cleanly forward the user-requested parameters to
     # WhisperModel.transcribe while keeping get_subtitles unaware of them.
     def transcribe_fn(audio_path: str):
-        kwargs = {"task": task}
-        # Only pass language if the user gave an explicit non-auto value.  For
-        # translation, Whisper works fine without forcing the source language,
-        # and some versions behave oddly when both options are combined.
+        call_kwargs = {
+            "return_timestamps": True,
+            "chunk_length_s": 30,
+            "batch_size": 24,
+        }
+
+        # Pass task and language through generate_kwargs for transformers pipeline
+        generate_kwargs = {}
+        if task == "translate":
+            generate_kwargs["task"] = "translate"
+        elif task == "transcribe":
+            generate_kwargs["task"] = "transcribe"
+        
         if language != "auto":
-            kwargs["language"] = final_language
-        return model.transcribe(audio_path, **kwargs)
+            generate_kwargs["language"] = final_language
+            
+        # Clear any conflicting forced_decoder_ids when using task parameter
+        generate_kwargs["forced_decoder_ids"] = None
+        
+        if generate_kwargs:
+            call_kwargs["generate_kwargs"] = generate_kwargs
+
+        outputs = pipe(audio_path, **call_kwargs)
+
+        # Convert pipeline chunks to faster-whisper compatible segments
+        segments = []
+        for ch in outputs.get("chunks", []):
+            start, end = ch["timestamp"]
+            segments.append(type("Segment", (), {"start": start, "end": end, "text": ch["text"]}))
+
+        duration = segments[-1].end if segments else 0.0
+        info = SimpleNamespace(duration=duration)
+        return segments, info
 
     # Subtitle generation phase
     logger.info(f"🎯 Starting subtitle generation for {len(audios)} file(s)...")
